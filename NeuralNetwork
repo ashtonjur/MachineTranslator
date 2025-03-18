@@ -314,7 +314,7 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 criterion = nn.CrossEntropyLoss(ignore_index=0)
 epoch_losses = []
 
-num_epochs = 100
+num_epochs = 1000
 for epoch in range(num_epochs):
     train_loss, epoch_losses_batch = train(model, train_loader, optimizer, criterion, device)
     epoch_losses.extend(epoch_losses_batch)
