@@ -23,56 +23,11 @@ def tokenize(text):
         tokens = re.findall(r'\w+|[^\w\s]', text)
         return tokens
 
-
-class Vocabulary:
-    def __init__(self):
-        self.token_to_id = {"<pad>": 0, "<unk>": 1}
-        self.id_to_token = {0: "<pad>", 1: "<unk>"}
-        self.idx = 2
-
-    def add_sentence(self, sentence):
-        for word in sentence:
-            if word not in self.token_to_id:
-                self.token_to_id[word] = self.idx
-                self.id_to_token[self.idx] = word
-                self.idx += 1
-
-    def sentence_to_ids(self, sentence):
-        return [self.token_to_id.get(word, 1) for word in sentence]
-
-    def ids_to_sentence(self, ids):
-        return ' '.join([self.id_to_token.get(id, "<unk>") for id in ids])
-
-    def __len__(self):
-        return len(self.token_to_id)
-
-
 def load_data(src_file, tgt_file):
     with open(src_file, 'r', encoding='utf-8') as src_f, open(tgt_file, 'r', encoding='utf-8') as tgt_f:
         src_sentences = [["<sos>"] + tokenize(line.strip()) + ["<eos>"] for line in src_f.readlines()]
         tgt_sentences = [["<sos>"] + tokenize(line.strip()) + ["<eos>"] for line in tgt_f.readlines()]
     return src_sentences, tgt_sentences
-
-
-class TranslationDataset(Dataset):
-    def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, pad_token=0):
-        self.src_sentences = src_sentences
-        self.tgt_sentences = tgt_sentences
-        self.src_vocab = src_vocab
-        self.tgt_vocab = tgt_vocab
-        self.pad_token = pad_token
-    def __len__(self):
-        return len(self.src_sentences)
-
-    def __getitem__(self, idx):
-        src_sentence = self.src_sentences[idx]
-        tgt_sentence = self.tgt_sentences[idx]
-
-        src_ids = torch.tensor(self.src_vocab.sentence_to_ids(src_sentence), dtype=torch.long)
-        tgt_ids = torch.tensor(self.tgt_vocab.sentence_to_ids(tgt_sentence), dtype=torch.long)
-
-        return src_ids, tgt_ids
-
 
 def collate_fn(batch):
     src_batch = [item[0] for item in batch]
