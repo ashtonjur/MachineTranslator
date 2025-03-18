@@ -1,0 +1,356 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import math
+import re
+from torch.nn.utils.rnn import pad_sequence
+import os
+import time
+import datetime
+
+
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Selected device: {device}")
+
+scaler = torch.cuda.amp.GradScaler()
+accumulation_steps = 2
+
+def tokenize(text):
+    if isinstance(text, str):
+        tokens = re.findall(r'\w+|[^\w\s]', text)
+        return tokens
+
+
+class Vocabulary:
+    def __init__(self):
+        self.token_to_id = {"<pad>": 0, "<unk>": 1}
+        self.id_to_token = {0: "<pad>", 1: "<unk>"}
+        self.idx = 2
+
+    def add_sentence(self, sentence):
+        for word in sentence:
+            if word not in self.token_to_id:
+                self.token_to_id[word] = self.idx
+                self.id_to_token[self.idx] = word
+                self.idx += 1
+
+    def sentence_to_ids(self, sentence):
+        return [self.token_to_id.get(word, 1) for word in sentence]
+
+    def ids_to_sentence(self, ids):
+        return ' '.join([self.id_to_token.get(id, "<unk>") for id in ids])
+
+    def __len__(self):
+        return len(self.token_to_id)
+
+
+def load_data(src_file, tgt_file):
+    with open(src_file, 'r', encoding='utf-8') as src_f, open(tgt_file, 'r', encoding='utf-8') as tgt_f:
+        src_sentences = [["<sos>"] + tokenize(line.strip()) + ["<eos>"] for line in src_f.readlines()]
+        tgt_sentences = [["<sos>"] + tokenize(line.strip()) + ["<eos>"] for line in tgt_f.readlines()]
+    return src_sentences, tgt_sentences
+
+
+class TranslationDataset(Dataset):
+    def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, pad_token=0):
+        self.src_sentences = src_sentences
+        self.tgt_sentences = tgt_sentences
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.pad_token = pad_token
+    def __len__(self):
+        return len(self.src_sentences)
+
+    def __getitem__(self, idx):
+        src_sentence = self.src_sentences[idx]
+        tgt_sentence = self.tgt_sentences[idx]
+
+        src_ids = torch.tensor(self.src_vocab.sentence_to_ids(src_sentence), dtype=torch.long)
+        tgt_ids = torch.tensor(self.tgt_vocab.sentence_to_ids(tgt_sentence), dtype=torch.long)
+
+        return src_ids, tgt_ids
+
+
+def collate_fn(batch):
+    src_batch = [item[0] for item in batch]
+    tgt_batch = [item[1] for item in batch]
+
+    src_batch = pad_sequence(src_batch, batch_first=True, padding_value=0)
+    tgt_batch = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
+
+    return src_batch, tgt_batch
+
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self):
+        super(ScaledDotProductAttention, self).__init__()
+
+    def forward(self, query, key, value, mask=None):
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        attn_weights = torch.softmax(scores, dim=-1)
+        output = torch.matmul(attn_weights, value)
+        return output, attn_weights
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_size, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.embed_size = embed_size
+        self.num_heads = num_heads
+        self.head_dim = embed_size // num_heads
+
+        self.query_linear = nn.Linear(embed_size, embed_size)
+        self.key_linear = nn.Linear(embed_size, embed_size)
+        self.value_linear = nn.Linear(embed_size, embed_size)
+        self.fc_out = nn.Linear(embed_size, embed_size)
+        self.attn = ScaledDotProductAttention()
+
+    def forward(self, query, key, value, mask=None):
+        N = query.size(0)
+        Q = self.query_linear(query)
+        K = self.key_linear(key)
+        V = self.value_linear(value)
+
+        Q = Q.view(N, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(N, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(N, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        out, attn_weights = self.attn(Q, K, V, mask)
+
+        out = out.transpose(1, 2).contiguous().view(N, -1, self.num_heads * self.head_dim)
+        out = self.fc_out(out)
+        return out, attn_weights
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, embed_size, ff_hidden_size):
+        super(PositionwiseFeedForward, self).__init__()
+        self.fc1 = nn.Linear(embed_size, ff_hidden_size)
+        self.fc2 = nn.Linear(ff_hidden_size, embed_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_size, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+
+        pe = torch.zeros(max_len, embed_size)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, embed_size, 2).float() * -(math.log(10000.0) / embed_size))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.pe = pe.unsqueeze(0)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        return self.pe[:, :seq_len, :].to(x.device)
+
+def create_tgt_mask(tgt):
+    seq_len = tgt.size(1)
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=tgt.device)).bool()
+    return mask.unsqueeze(0)
+
+def create_src_mask(src, pad_token=0):
+    return (src != pad_token).unsqueeze(1).unsqueeze(2)
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, embed_size, num_heads, ff_hidden_size, dropout=0.1):
+        super(EncoderLayer, self).__init__()
+        self.attn = MultiHeadAttention(embed_size, num_heads)
+        self.ffn = PositionwiseFeedForward(embed_size, ff_hidden_size)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src, mask=None):
+        attn_out, _ = self.attn(src, src, src, mask)
+        src = self.norm1(src + self.dropout(attn_out))
+
+        ffn_out = self.ffn(src)
+        src = self.norm2(src + self.dropout(ffn_out))
+
+        return src
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, embed_size, num_heads, ff_hidden_size, dropout=0.1):
+        super(DecoderLayer, self).__init__()
+        self.attn1 = MultiHeadAttention(embed_size, num_heads)
+        self.attn2 = MultiHeadAttention(embed_size, num_heads)
+        self.ffn = PositionwiseFeedForward(embed_size, ff_hidden_size)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.norm3 = nn.LayerNorm(embed_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tgt, src, tgt_mask=None, src_mask=None):
+        attn_out1, _ = self.attn1(tgt, tgt, tgt, tgt_mask)
+        tgt = self.norm1(tgt + self.dropout(attn_out1))
+
+        attn_out2, _ = self.attn2(tgt, src, src, src_mask)
+        tgt = self.norm2(tgt + self.dropout(attn_out2))
+
+        ffn_out = self.ffn(tgt)
+        tgt = self.norm3(tgt + self.dropout(ffn_out))
+
+        return tgt
+
+
+class Transformer(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, embed_size, num_heads, num_layers, ff_hidden_size, dropout=0.1):
+        super(Transformer, self).__init__()
+
+        self.src_embedding = nn.Embedding(src_vocab_size, embed_size)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, embed_size)
+
+        self.positional_encoding = PositionalEncoding(embed_size)
+
+        self.encoder_layers = nn.ModuleList([EncoderLayer(embed_size, num_heads, ff_hidden_size, dropout) for _ in range(num_layers)])
+        self.decoder_layers = nn.ModuleList([DecoderLayer(embed_size, num_heads, ff_hidden_size, dropout) for _ in range(num_layers)])
+
+        self.fc_out = nn.Linear(embed_size, tgt_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        src_embed = self.src_embedding(src) + self.positional_encoding(src)
+        tgt_embed = self.tgt_embedding(tgt) + self.positional_encoding(tgt)
+
+        for layer in self.encoder_layers:
+            src_embed = layer(src_embed, src_mask)
+
+        for layer in self.decoder_layers:
+            tgt_embed = layer(tgt_embed, src_embed, tgt_mask, src_mask)
+
+        output = self.fc_out(tgt_embed)
+
+        return output
+
+
+def save_model(model, file_path):
+    torch.save(model.state_dict(), file_path)
+    print(f"Model saved to {file_path}")
+
+def load_model(file_path, model):
+    model.load_state_dict(torch.load(file_path))
+    model.eval()
+    print(f"Model loaded from {file_path}")
+
+model_save_path = "transformer_translation_model.pt"
+
+def train(model, iterator, optimizer, criterion, device):
+    model.train()
+    epoch_loss = 0
+    epoch_losses = []
+
+    for i, (src, tgt) in enumerate(iterator):
+        begin_time = time.time()
+        ct = datetime.datetime.now()
+        print(f"Start iteration {i} at {ct}")
+
+        src, tgt = src.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
+        tgt_input = tgt[:, :-1]
+        tgt_output = tgt[:, 1:]
+
+        src_mask = create_src_mask(src)
+        tgt_mask = create_tgt_mask(tgt_input)
+
+        with torch.cuda.amp.autocast():
+            output = model(src, tgt_input, src_mask, tgt_mask)
+            output = output.view(-1, output.shape[-1])
+            tgt_output = tgt_output.contiguous().view(-1)
+            loss = criterion(output, tgt_output)
+
+        scaler.scale(loss).backward()
+        if (i + 1) % accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        epoch_loss += loss.item()
+
+        end_time = time.time()
+
+        print(f"Iteration {i}, execution time: {end_time - begin_time}s\n")
+
+    epoch_losses.append(epoch_loss / len(iterator))
+    return epoch_loss / len(iterator), epoch_losses
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+src_sentences, tgt_sentences = load_data('OpenSubtitles.en-pl.en', 'OpenSubtitles.en-pl.pl.txt')
+
+src_vocab = Vocabulary()
+tgt_vocab = Vocabulary()
+
+for sentence in src_sentences:
+    src_vocab.add_sentence(sentence)
+for sentence in tgt_sentences:
+    tgt_vocab.add_sentence(sentence)
+
+train_dataset = TranslationDataset(src_sentences, tgt_sentences, src_vocab, tgt_vocab)
+train_loader = DataLoader(train_dataset, batch_size=16, collate_fn=collate_fn)
+
+embed_size = 128
+num_heads = 8
+num_layers = 4
+ff_hidden_size = 256
+learning_rate = 0.0001
+dropout = 0.1
+
+model = Transformer(len(src_vocab), len(tgt_vocab), embed_size, num_heads, num_layers, ff_hidden_size, dropout).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+criterion = nn.CrossEntropyLoss(ignore_index=0)
+epoch_losses = []
+
+num_epochs = 100
+for epoch in range(num_epochs):
+    train_loss, epoch_losses_batch = train(model, train_loader, optimizer, criterion, device)
+    epoch_losses.extend(epoch_losses_batch)
+    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.8f}")
+    torch.cuda.empty_cache()
+    save_model(model, model_save_path)
+
+def translate(model, sentence, src_vocab, tgt_vocab, device, max_len=100):
+    model.eval()
+    with torch.no_grad():
+        tokens = tokenize(sentence)
+        src_ids = torch.tensor(src_vocab.sentence_to_ids(["<sos>"] + tokens + ["<eos>"]), dtype=torch.long).unsqueeze(0).to(device)
+        src_mask = create_src_mask(src_ids)
+
+        tgt_ids = torch.tensor([tgt_vocab.token_to_id["<sos>"]], dtype=torch.long).unsqueeze(0).to(device)
+
+        for _ in range(max_len):
+            tgt_mask = create_tgt_mask(tgt_ids)
+            with torch.cuda.amp.autocast():
+                output = model(src_ids, tgt_ids, src_mask, tgt_mask)
+            next_token_id = output.argmax(dim=-1)[:, -1].item()
+            if next_token_id == tgt_vocab.token_to_id["<eos>"]:
+                break
+            tgt_ids = torch.cat([tgt_ids, torch.tensor([[next_token_id]], device=device)], dim=1)
+
+        decoded_tokens = tgt_vocab.ids_to_sentence(tgt_ids.squeeze().cpu().tolist()[1:])
+        words = decoded_tokens.split(' ')
+
+        formatted_sentence = ''
+        for i, word in enumerate(words):
+            if i == 0:
+                formatted_sentence += word.capitalize()
+            elif word in {'.', ',', '!', '?'}:
+                formatted_sentence += word
+            else:
+                formatted_sentence += ' ' + word
+
+        return formatted_sentence
+
