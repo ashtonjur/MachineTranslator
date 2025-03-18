@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 import math
 import re
-from torch.nn.utils.rnn import pad_sequence
 import os
 import time
 import datetime
