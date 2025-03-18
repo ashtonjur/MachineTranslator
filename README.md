@@ -74,7 +74,7 @@ The encoder and decoder layers are composed of these modules.
 
 4. Train the model:
     ```python
-    num_epochs = 100
+    num_epochs = 1000
     for epoch in range(num_epochs):
         train_loss, epoch_losses_batch = train(model, train_loader, optimizer, criterion, device)
         epoch_losses.extend(epoch_losses_batch)
